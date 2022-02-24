@@ -1,0 +1,50 @@
+
+Parameters:
+  ECRRepositoryLatestImage:
+    Type: String
+    Description: ECR Path to image
+
+  ECSServiceName:
+    Description: Desired name to give to the Service Running your Task
+    Type: String
+    
+  ECSClusterId:
+    Description: ECS Cluster to be used by the service.
+    Type: String
+
+  TargetGroupARN:
+    Type: String
+    Description: The TargetGroup ARN from the ALB configuration
+
+  ContainerName:
+    Type: String
+    Description: The Desired Name of the Container
+
+Resources:  
+  GoDemoTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - 
+          Name: !Ref ContainerName
+          Image: !Ref ECRRepositoryLatestImage
+          Cpu: 128
+          Memory: 128
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Command: 
+            - "./main"
+          Essential: true
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSClusterId
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroupARN
+          ContainerName: !Ref ContainerName
+          ContainerPort: 8080
+      SchedulingStrategy: DAEMON
+      ServiceName: !Ref ECSServiceName
+      TaskDefinition: !Ref GoDemoTask

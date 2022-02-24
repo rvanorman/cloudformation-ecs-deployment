@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: AWS CloudFormation for the test environment's ECS Cluster
+
+Parameters:
+  EnvironmentType:
+    Description: 'Specify the Environment type of the stack.'
+    Type: String
+    Default: Test
+    AllowedValues:
+      - Dev
+      - Test
+      - Prod
+    ConstraintDescription: 'Specify either Dev, Test or Prod.'
+
+  NetworkPrefix:
+    Type: String
+    Description: The prefix to add to all networking pieces.
+
+  KeyPairName:
+    Type: String
+    Default: "MyKeyName"
+    Description: 'Please provide the name'
+
+  ECSAmiID:
+    Type: String
+    Description: 'The ID of the AMI.'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'The VPC ID'
+
+  PrivateSubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: 'The Private Subnet ID #1'
+
+  PrivateSubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: 'The Private Subnet ID #2'
+
+  ClusterMinSize:
+    Description: Minimum Number of EC2 instances to launch for ECS Cluster
+    Type: Number
+
+  ClusterDesiredSize:
+    Description: Desired Number of EC2 instances to launch for ECS Cluster
+    Type: Number
+
+  ClusterMaxSize:
+    Description: Maximum Number of EC2 instances to launch for ECS Cluster
+    Type: Number
+
+  TargetGroupARN:
+    Type: String
+    Description: The TargetGroup ARN from the ALB configuration
+
+Mappings:
+  EnvironmentToInstanceType:
+    Dev:
+      InstanceType: t2.nano
+    Test:
+      InstanceType: t2.micro
+    Prod:
+      InstanceType: t2.small
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Join [ '-', [ !Ref NetworkPrefix, cluster ]]
+  
+  ECSInstancesSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ECS instances
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: !ImportValue vpc-VpcCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref VpcId
+
+  ECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnetId1
+        - !Ref PrivateSubnetId2
+      LaunchConfigurationName: !Ref ContainerInstanceHosts
+      DesiredCapacity: !Ref ClusterDesiredSize
+      MinSize: !Ref ClusterMinSize
+      MaxSize: !Ref ClusterMaxSize
+      TargetGroupARNs:
+        - !Ref TargetGroupARN
+      Tags:
+        - Key: Network
+          Value: Private
+          PropagateAtLaunch: true
+        - Key: Name
+          Value: ECS
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 10
+        PauseTime: PT5M
+        WaitOnResourceSignals: true
+  
+  ContainerInstanceHosts:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_add_instance_to_cluster:
+              command: !Join [ '\n', [ '#!/bin/bash -xe', which aws, date, echo metadata ] ]
+
+          files:
+            /etc/ecs/ecs.config:
+              content: !Sub |
+                ECS_CLUSTER=${ECSCluster}
+                ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION=5m
+                ECS_CONTAINER_STOP_TIMEOUT=150s
+                ECS_ENABLE_TASK_IAM_ROLE=true
+                ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST=true
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: 000400
+              owner: root
+              group: root
+
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ContainerInstanceHosts.Metadata.AWS::CloudFormation::Init
+                action=../../opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ContainerInstanceHosts --region ${AWS::Region}
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+    Properties:
+      ImageId: !Ref ECSAmiID
+      InstanceType: !FindInMap [EnvironmentToInstanceType, !Ref EnvironmentType, InstanceType]
+      IamInstanceProfile: !ImportValue EC2InstanceProfile
+      SecurityGroups:
+        - !Ref ECSInstancesSecurityGroup
+      KeyName: !Ref KeyPairName
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+          yum install -y https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+          yum install -y aws-cfn-bootstrap hibagent 
+          /opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ContainerInstanceHosts
+          /opt/aws/bin/cfn-signal -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSAutoScalingGroup
+          /usr/bin/enable-ec2-spot-hibernation
+          instance_id=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .instanceId)
+          sed -i -e \"s/{cluster_name}/$cluster/g\" -e \"s/{container_instance_id}/$instance_id/g\" /etc/awslogs/awslogs.conf
+          start ecs || true
+          start amazon-ssm-agent || true
+
+Outputs:
+  ECSClusterId: 
+    Value: !Ref ECSCluster
+    Export:
+      Name: ECSClusterId
+  
